@@ -12,6 +12,7 @@ import sbt.internal.bsp.codec.JsonProtocol.BspConnectionDetailsFormat
 import sbt.internal.util.Util
 import sbt.io.IO
 import sjsonnew.support.scalajson.unsafe.{ CompactPrinter, Converter }
+import sjsonnew.shaded.scalajson.ast.unsafe.{ JObject, JField, JString }
 
 import java.io.File
 import java.nio.file.{ Files, Paths }
@@ -41,24 +42,57 @@ object BuildServerConnection {
       .map(_.replace(" ", "%20"))
       .map(jar => s"--sbt-launch-jar=$jar")
 
-    val argv =
-      Vector(
-        s"$javaHome/bin/java",
-        "-Xms100m",
-        "-Xmx100m",
-      ) ++
-        sbtOptsArgs ++
+    val argv = findSbtn() match {
+      case Some(sbtnPath) =>
+        Vector(sbtnPath, "-bsp")
+      case None =>
         Vector(
-          "-classpath",
-          classPath,
+          s"$javaHome/bin/java",
+          "-Xms100m",
+          "-Xmx100m",
         ) ++
-        sbtScript ++
-        Vector("xsbt.boot.Boot", "-bsp") ++
-        (if (sbtScript.isEmpty) sbtLaunchJar else None)
+          sbtOptsArgs ++
+          Vector(
+            "-classpath",
+            classPath,
+          ) ++
+          sbtScript ++
+          Vector("xsbt.boot.Boot", "-bsp") ++
+          (if (sbtScript.isEmpty) sbtLaunchJar else None)
+    }
 
     val details = BspConnectionDetails(name, sbtVersion, bspVersion, languages, argv)
-    val json = Converter.toJson(details).get
-    IO.write(bspConnectionFile, CompactPrinter(json), append = false)
+    val detailsJson = Converter.toJson(details).get
+
+    // Add "data" field with portfile path for direct socket connections.
+    // The portfile is always at project/target/active.json relative to the project root.
+    val portfilePath = "project/target/active.json"
+    val dataObj = JObject(JField("sbtPortfile", JString(portfilePath)))
+    val enrichedJson = detailsJson match {
+      case JObject(fields) => JObject(fields :+ JField("data", dataObj))
+      case other           => other
+    }
+    IO.write(bspConnectionFile, CompactPrinter(enrichedJson), append = false)
+  }
+
+  private def findSbtn(): Option[String] = {
+    val fileName = if (Properties.isWin) "sbtn.exe" else "sbtn"
+    val envPath = sys.env.collectFirst {
+      case (k, v) if k.toUpperCase() == "PATH" => v
+    }
+    val allPaths = envPath match
+      case Some(path) => path.split(File.pathSeparator).toList.map(Paths.get(_))
+      case _          => Nil
+
+    // Also check near the sbt script location
+    val sbtScriptDir = Option(System.getProperty("sbt.script"))
+      .map(Paths.get(_).getParent)
+      .toList
+
+    (allPaths ++ sbtScriptDir)
+      .map(_.resolve(fileName))
+      .find(file => Files.exists(file) && Files.isExecutable(file))
+      .map(_.toString)
   }
 
   private def sbtScriptInPath: Option[String] = {

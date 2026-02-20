@@ -29,7 +29,7 @@ import sbt.librarymanagement.CrossVersion.binaryScalaVersion
 import sbt.librarymanagement.{ Configuration, ScalaArtifacts, UpdateReport }
 import sbt.std.TaskExtra
 import sbt.util.Logger
-import sjsonnew.shaded.scalajson.ast.unsafe.{ JNull, JValue }
+import sjsonnew.shaded.scalajson.ast.unsafe.{ JNull, JObject, JString, JValue }
 import sjsonnew.support.scalajson.unsafe.{ CompactPrinter, Converter, Parser as JsonParser }
 
 import java.io.File
@@ -407,6 +407,32 @@ object BuildServerProtocol {
         onRequest = {
           case r if r.method == Method.Initialize =>
             val params = Converter.fromJson[InitializeBuildParams](json(r)).get
+
+            // Authenticate if the server requires token auth (for direct socket connections)
+            if (callback.authOptions(ServerAuthentication.Token)) {
+              val token = params.data
+                .flatMap {
+                  case JObject(fields) =>
+                    fields.collectFirst {
+                      case f if f.field == "token" =>
+                        f.value match {
+                          case JString(t) => t
+                          case _          => ""
+                        }
+                    }
+                  case _ => None
+                }
+                .getOrElse(
+                  throw LangServerError(
+                    ErrorCodes.InvalidRequest,
+                    "token required for BSP authentication"
+                  )
+                )
+              if (!callback.authenticate(token))
+                throw LangServerError(ErrorCodes.InvalidRequest, "invalid BSP authentication token")
+            }
+            callback.setInitialized(true)
+
             checkMetalsCompatibility(semanticdbEnabled, semanticdbVersion, params, callback.log)
 
             val response = InitializeBuildResult(
@@ -520,7 +546,11 @@ object BuildServerProtocol {
         onResponse = PartialFunction.empty,
         onNotification = {
           case r if r.method == Method.Exit =>
-            val _ = callback.appendExec(BasicCommandStrings.TerminateAction, None)
+            // Disconnect this BSP client channel only; don't terminate the shared server.
+            val _ = callback.appendExec(
+              s"${BasicCommandStrings.DisconnectNetworkChannel} ${callback.name}",
+              None
+            )
         },
       )
     }
